@@ -1,13 +1,23 @@
 package com.anyapk.installer
 
 import android.content.Context
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
+import io.github.muntashirakon.adb.AbsAdbConnectionManager
 import io.github.muntashirakon.adb.AdbStream
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
 
 object AdbInstaller {
 
     private const val LOCALHOST = "127.0.0.1"
-    private const val DEFAULT_PORT = 5555
+    private const val TARGET_PACKAGE = "com.carriez.flutter_hbb"
 
     enum class ConnectionStatus {
         NOT_CONNECTED,
@@ -16,156 +26,205 @@ object AdbInstaller {
         ERROR
     }
 
-    // Keep track of connection state without constantly reconnecting
-    @Volatile
-    private var lastConnectionCheck: Long = 0
-    @Volatile
-    private var lastConnectionStatus: ConnectionStatus = ConnectionStatus.NEEDS_PAIRING
-    private const val CONNECTION_CHECK_CACHE_MS = 2000 // Cache for 2 seconds
+    @Volatile private var lastConnectionCheck: Long = 0
+    @Volatile private var lastConnectionStatus: ConnectionStatus = ConnectionStatus.NEEDS_PAIRING
+    private const val CONNECTION_CACHE_MS = 2000L
+
+    // ─────────────────────────────────────────────
+    // Toast helper (safe to call from any thread)
+    // ─────────────────────────────────────────────
+
+    private fun toast(context: Context, message: String, long: Boolean = false) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(
+                context,
+                message,
+                if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Shell command runner (suspend, reusable)
+    // ─────────────────────────────────────────────
+
+    private suspend fun runShell(
+        manager: AbsAdbConnectionManager,
+        command: String,
+        timeoutMs: Int = 5000
+    ): String = withContext(Dispatchers.IO) {
+        var stream: AdbStream? = null
+        return@withContext try {
+            stream = manager.openStream("shell:$command")
+            val inputStream = stream.openInputStream()
+            val buffer = ByteArray(1024)
+            val output = StringBuilder()
+            var waited = 0
+
+            while (waited < timeoutMs) {
+                if (inputStream.available() > 0) {
+                    val bytesRead = inputStream.read(buffer)
+                    if (bytesRead == -1) break
+                    if (bytesRead > 0) output.append(String(buffer, 0, bytesRead))
+                    // Keep reading if more data is available
+                    if (inputStream.available() == 0) {
+                        delay(50)
+                        if (inputStream.available() == 0) break
+                    }
+                } else {
+                    delay(100)
+                    waited += 100
+                }
+            }
+
+            output.toString().trim()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            ""
+        } finally {
+            try { stream?.close() } catch (_: Exception) {}
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Connection status
+    // ─────────────────────────────────────────────
 
     fun getConnectionStatus(context: Context, forceCheck: Boolean = false): ConnectionStatus {
-        // Use cached status if recent (unless forced)
         val now = System.currentTimeMillis()
-        if (!forceCheck && (now - lastConnectionCheck) < CONNECTION_CHECK_CACHE_MS) {
+        if (!forceCheck && (now - lastConnectionCheck) < CONNECTION_CACHE_MS) {
             return lastConnectionStatus
         }
 
-        var stream: AdbStream? = null
         val status = try {
             val manager = AdbConnectionManager.getInstance(context)
-
-            // Try to auto-connect using service discovery (works after pairing)
             if (!manager.autoConnect(context, 3000)) {
                 ConnectionStatus.NEEDS_PAIRING
             } else {
-                // Actually test the connection with a simple command
-                try {
-                    stream = manager.openStream("shell:echo test")
-                    val buffer = ByteArray(128)
-                    val bytesRead = stream.openInputStream().read(buffer)
-                    stream.close()
-
-                    // If we got a response, we're connected and authorized
-                    if (bytesRead > 0) {
-                        ConnectionStatus.CONNECTED
-                    } else {
-                        ConnectionStatus.NEEDS_PAIRING
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    try {
-                        stream?.close()
-                    } catch (ex: Exception) {
-                        ex.printStackTrace()
-                    }
-                    // Don't close manager here - let it be reused
-                    ConnectionStatus.NEEDS_PAIRING
+                runBlocking {
+                    val result = runShell(manager, "echo __ping__", 3000)
+                    if (result.contains("__ping__")) ConnectionStatus.CONNECTED
+                    else ConnectionStatus.NEEDS_PAIRING
                 }
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            ConnectionStatus.NEEDS_PAIRING
+            ConnectionStatus.ERROR
         }
 
-        lastConnectionCheck = now
+        lastConnectionCheck = System.currentTimeMillis()
         lastConnectionStatus = status
         return status
     }
 
-    suspend fun pair(context: Context, pairingCode: String, pairingPort: Int): Result<Boolean> = withContext(Dispatchers.IO) {
+    // ─────────────────────────────────────────────
+    // Pairing
+    // ─────────────────────────────────────────────
+
+    suspend fun pair(
+        context: Context,
+        pairingCode: String,
+        pairingPort: Int
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
         return@withContext try {
+            toast(context, "⏳ Pairing with code $pairingCode...")
             val manager = AdbConnectionManager.getInstance(context)
-            // Pair with the device
             manager.pair(LOCALHOST, pairingPort, pairingCode)
+            toast(context, "✅ Pairing successful!", long = true)
             Result.success(true)
         } catch (e: Exception) {
             e.printStackTrace()
+            toast(context, "❌ Pairing failed: ${e.message}", long = true)
             Result.failure(e)
         }
     }
 
+    // ─────────────────────────────────────────────
+    // Test connection
+    // ─────────────────────────────────────────────
+
     suspend fun testConnection(context: Context): Result<Boolean> = withContext(Dispatchers.IO) {
-        var stream: AdbStream? = null
         return@withContext try {
+            toast(context, "⏳ Testing ADB connection...")
             val manager = AdbConnectionManager.getInstance(context)
 
-            // Connect to local ADB - this should trigger authorization prompt
             if (!manager.autoConnect(context, 10000)) {
-                return@withContext Result.failure(Exception("Could not connect to ADB. Make sure wireless debugging is enabled."))
+                val msg = "❌ Could not connect. Enable Wireless Debugging."
+                toast(context, msg, long = true)
+                return@withContext Result.failure(Exception(msg))
             }
 
-            // Try to execute a simple command to verify authorization
-            stream = manager.openStream("shell:echo test")
-            val output = StringBuilder()
-            val inputStream = stream.openInputStream()
-            val buffer = ByteArray(128)
-            var bytesRead: Int
-
-            // Read with timeout
-            var totalWait = 0
-            while (totalWait < 5000) {
-                if (inputStream.available() > 0) {
-                    bytesRead = inputStream.read(buffer)
-                    if (bytesRead > 0) {
-                        output.append(String(buffer, 0, bytesRead))
-                        break
-                    }
-                }
-                kotlinx.coroutines.delay(100)
-                totalWait += 100
+            // Basic echo test
+            val echo = runShell(manager, "echo __test__", 5000)
+            if (!echo.contains("__test__")) {
+                val msg = "❌ ADB connected but not authorized. Approve the prompt on device."
+                toast(context, msg, long = true)
+                manager.close()
+                return@withContext Result.failure(Exception(msg))
             }
 
-            stream.close()
+            // Extra diagnostics
+            val sdkVersion = runShell(manager, "getprop ro.build.version.sdk")
+            val deviceModel = runShell(manager, "getprop ro.product.model")
+            val adbUser = runShell(manager, "id")
+
             manager.close()
 
-            if (output.contains("test")) {
-                Result.success(true)
-            } else {
-                Result.failure(Exception("Connection test failed. Did you authorize the prompt?"))
-            }
+            val info = "✅ Connected!\nDevice: $deviceModel (API $sdkVersion)\nUser: $adbUser"
+            toast(context, info, long = true)
+            Result.success(true)
 
         } catch (e: Exception) {
             e.printStackTrace()
-            try {
-                stream?.close()
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-            }
-            Result.failure(Exception("Authorization required. Check for 'Allow USB debugging?' prompt and tap 'Always allow'."))
+            toast(context, "❌ Connection error: ${e.message}", long = true)
+            Result.failure(Exception("Authorization required. Check for debug prompt on device."))
         }
     }
 
+    // ─────────────────────────────────────────────
+    // Install APK
+    // ─────────────────────────────────────────────
+
     suspend fun install(context: Context, apkPath: String): Result<String> = withContext(Dispatchers.IO) {
         var stream: AdbStream? = null
-        var manager: io.github.muntashirakon.adb.AbsAdbConnectionManager? = null
+        var manager: AbsAdbConnectionManager? = null
+
         try {
-            // Invalidate cache before install attempt
-            lastConnectionCheck = 0
+            lastConnectionCheck = 0 // Invalidate cache
+            toast(context, "⏳ Connecting to ADB...")
 
-            // Create a NEW manager instance for this install to avoid stale connections
-            manager = object : io.github.muntashirakon.adb.AbsAdbConnectionManager() {
+            manager = object : AbsAdbConnectionManager() {
                 private val delegate = AdbConnectionManager.getInstance(context)
-
                 override fun getPrivateKey() = delegate.getPrivateKey()
                 override fun getCertificate() = delegate.getCertificate()
                 override fun getDeviceName() = delegate.getDeviceName()
             }
-            manager.setApi(android.os.Build.VERSION.SDK_INT)
+            manager.setApi(Build.VERSION.SDK_INT)
 
-            // Connect to local ADB using auto-discovery
             if (!manager.autoConnect(context, 10000)) {
-                return@withContext Result.failure(Exception("Failed to connect to ADB. Make sure wireless debugging is enabled and you've paired."))
+                val msg = "❌ Failed to connect. Ensure Wireless Debugging is enabled and paired."
+                toast(context, msg, long = true)
+                return@withContext Result.failure(Exception(msg))
             }
 
-            // Use proper install protocol - stream the APK data
+            // Check if already installed
+            val existingVersion = runShell(
+                manager,
+                "dumpsys package $TARGET_PACKAGE | grep versionName",
+                3000
+            )
+            if (existingVersion.isNotEmpty()) {
+                toast(context, "ℹ️ Existing version found: $existingVersion — upgrading...")
+            }
+
             val apkFile = java.io.File(apkPath)
             val apkSize = apkFile.length()
+            toast(context, "📦 Installing ${apkFile.name} (${apkSize / 1024}KB)...")
 
-            // Open install stream with size and -g flag to grant all permissions
-            stream = manager.openStream("exec:cmd package install -g -S $apkSize")
-
-            // Stream the APK data
+            // Stream APK via exec:cmd install
+            stream = manager.openStream("exec:cmd package install -g -r -t -S $apkSize")
             val outputStream = stream.openOutputStream()
+
             java.io.FileInputStream(apkFile).use { input ->
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
@@ -175,154 +234,155 @@ object AdbInstaller {
                 outputStream.flush()
             }
 
-            // Read the response
+            // Read install result
             val output = StringBuilder()
             val inputStream = stream.openInputStream()
             val buffer = ByteArray(1024)
-            var bytesRead: Int
-            var totalWait = 0
-            val maxWait = 30000 // 30 seconds for install
+            var waited = 0
+            val maxWait = 30000
 
-            // Read with timeout
-            while (totalWait < maxWait) {
+            while (waited < maxWait) {
                 if (inputStream.available() > 0) {
-                    bytesRead = inputStream.read(buffer)
-                    if (bytesRead > 0) {
-                        output.append(String(buffer, 0, bytesRead))
-                    }
+                    val bytesRead = inputStream.read(buffer)
                     if (bytesRead == -1) break
+                    if (bytesRead > 0) output.append(String(buffer, 0, bytesRead))
                 } else {
-                    kotlinx.coroutines.delay(100)
-                    totalWait += 100
-                    // Check if we got a complete response
-                    val currentOutput = output.toString()
-                    if (currentOutput.contains("Success") || currentOutput.contains("Failure")) {
-                        break
-                    }
+                    delay(100)
+                    waited += 100
                 }
+                val current = output.toString()
+                if (current.contains("Success", ignoreCase = true) ||
+                    current.contains("Failure", ignoreCase = true) ||
+                    current.contains("Error", ignoreCase = true)
+                ) break
             }
 
-            val result = output.toString().trim()
             stream.close()
+            stream = null
 
-            // Check for success
-            if (result.contains("Success", ignoreCase = true)) {
-                // Extract package name from install output
-                val packageName = Regex("package ([^\\s]+)").find(result)?.groupValues?.get(1) ?: "unknown"
-                
-                // Update cache to show we're still connected
-                lastConnectionCheck = System.currentTimeMillis()
-                lastConnectionStatus = ConnectionStatus.CONNECTED
-                
-                delay(1000)
+            val installResult = output.toString().trim()
 
-                // Grant additional permissions
-                val grantResult = grantAdditionalPermissions(manager, "com.carriez.flutter_hbb")
-                
-                val finalMessage = "Installation successful${if (grantResult.isSuccess) "\n${grantResult.getOrNull()}" else "\n⚠️ ${grantResult.exceptionOrNull()?.message ?: "Some permissions may not have been granted"}"}"
-                Result.success(finalMessage)
-            } else {
-                Result.failure(Exception(result.ifEmpty { "Unknown error" }))
+            if (!installResult.contains("Success", ignoreCase = true)) {
+                val msg = "❌ Install failed: ${installResult.ifEmpty { "Unknown error" }}"
+                toast(context, msg, long = true)
+                return@withContext Result.failure(Exception(msg))
             }
+
+            toast(context, "✅ APK installed! Granting permissions...")
+
+            // Update cache
+            lastConnectionCheck = System.currentTimeMillis()
+            lastConnectionStatus = ConnectionStatus.CONNECTED
+
+            delay(800)
+
+            // Grant permissions
+            val permResult = grantPermissions(context, manager, TARGET_PACKAGE)
+
+            val finalMsg = if (permResult.isSuccess) {
+                "🎉 Install complete!\n${permResult.getOrNull()}"
+            } else {
+                "✅ Installed, but permissions had issues:\n${permResult.exceptionOrNull()?.message}"
+            }
+
+            toast(context, finalMsg, long = true)
+            Result.success(finalMsg)
 
         } catch (e: Exception) {
             e.printStackTrace()
-            try {
-                stream?.close()
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-            }
-            try {
-                manager?.close()
-            } catch (ex: Exception) {
-                ex.printStackTrace()
-            }
+            toast(context, "❌ Install error: ${e.message}", long = true)
             Result.failure(e)
         } finally {
-            try {
-                manager?.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            try { stream?.close() } catch (_: Exception) {}
+            try { manager?.close() } catch (_: Exception) {}
         }
     }
 
-    private fun grantAdditionalPermissions(
-        manager: io.github.muntashirakon.adb.AbsAdbConnectionManager?,
+    // ─────────────────────────────────────────────
+    // Grant permissions with verification
+    // ─────────────────────────────────────────────
+
+    private suspend fun grantPermissions(
+        context: Context,
+        manager: AbsAdbConnectionManager,
         packageName: String
-    ): Result<String> {
-        return try {
-            if (manager == null) {
-                return Result.failure(Exception("ADB Manager not available"))
-            }
+    ): Result<String> = withContext(Dispatchers.IO) {
+        data class PermissionTask(
+            val label: String,
+            val command: String,
+            val verifyCommand: String,
+            val verifyContains: String
+        )
 
-            val granted = mutableListOf<String>()
-            val failed = mutableListOf<String>()
+        val tasks = listOf(
+            PermissionTask(
+                label = "WRITE_SECURE_SETTINGS",
+                command = "pm grant $packageName android.permission.WRITE_SECURE_SETTINGS",
+                verifyCommand = "dumpsys package $packageName | grep WRITE_SECURE_SETTINGS",
+                verifyContains = "granted=true"
+            ),
+            PermissionTask(
+                label = "PROJECT_MEDIA (appops)",
+                command = "appops set $packageName PROJECT_MEDIA allow",
+                verifyCommand = "appops get $packageName PROJECT_MEDIA",
+                verifyContains = "allow"
+            ),
+            PermissionTask(
+                label = "SYSTEM_ALERT_WINDOW",
+                command = "appops set $packageName SYSTEM_ALERT_WINDOW allow",
+                verifyCommand = "appops get $packageName SYSTEM_ALERT_WINDOW",
+                verifyContains = "allow"
+            ),
+            PermissionTask(
+                label = "CAPTURE_VIDEO_OUTPUT",
+                command = "appops set $packageName CAPTURE_VIDEO_OUTPUT allow",
+                verifyCommand = "appops get $packageName CAPTURE_VIDEO_OUTPUT",
+                verifyContains = "allow"
+            )
+        )
 
-            // Grant WRITE_SECURE_SETTINGS permission
-            val grantStream1 = manager.openStream("shell:pm grant $packageName android.permission.WRITE_SECURE_SETTINGS")
-            val grantOutput1 = StringBuilder()
-            val inputStream1 = grantStream1.openInputStream()
-            val buffer = ByteArray(1024)
-            var bytesRead: Int
-            var totalWait = 0
+        val granted = mutableListOf<String>()
+        val failed = mutableListOf<String>()
 
-            while (totalWait < 5000) {
-                if (inputStream1.available() > 0) {
-                    bytesRead = inputStream1.read(buffer)
-                    if (bytesRead > 0) {
-                        grantOutput1.append(String(buffer, 0, bytesRead))
-                    }
-                    if (bytesRead == -1) break
+        for (task in tasks) {
+            try {
+                // Run grant command
+                val grantOutput = runShell(manager, task.command, 5000)
+
+                // Verify by running a check command
+                delay(300)
+                val verifyOutput = runShell(manager, task.verifyCommand, 5000)
+
+                val success = verifyOutput.contains(task.verifyContains, ignoreCase = true) ||
+                        (grantOutput.isEmpty() && !grantOutput.contains("error", ignoreCase = true))
+
+                if (success) {
+                    granted.add("✅ ${task.label}")
+                    toast(context, "✅ Granted: ${task.label}")
                 } else {
-                    java.lang.Thread.sleep(100)
-                    totalWait += 100
+                    val reason = grantOutput.ifEmpty { "Verification failed" }
+                    failed.add("❌ ${task.label}: $reason")
+                    toast(context, "⚠️ Failed: ${task.label} — $reason", long = true)
                 }
-            }
-            grantStream1.close()
 
-            if (grantOutput1.isEmpty() || !grantOutput1.contains("error", ignoreCase = true) && !grantOutput1.contains("fail", ignoreCase = true)) {
-                granted.add("WRITE_SECURE_SETTINGS")
-            } else {
-                failed.add("WRITE_SECURE_SETTINGS (${grantOutput1.trim()})")
+            } catch (e: Exception) {
+                failed.add("❌ ${task.label}: ${e.message}")
+                toast(context, "⚠️ Error granting ${task.label}: ${e.message}", long = true)
             }
 
-            // Grant PROJECT_MEDIA appops permission
-            val grantStream2 = manager.openStream("shell:appops set $packageName PROJECT_MEDIA allow")
-            val grantOutput2 = StringBuilder()
-            val inputStream2 = grantStream2.openInputStream()
-            totalWait = 0
+            delay(200) // Small gap between commands
+        }
 
-            while (totalWait < 5000) {
-                if (inputStream2.available() > 0) {
-                    bytesRead = inputStream2.read(buffer)
-                    if (bytesRead > 0) {
-                        grantOutput2.append(String(buffer, 0, bytesRead))
-                    }
-                    if (bytesRead == -1) break
-                } else {
-                    java.lang.Thread.sleep(100)
-                    totalWait += 100
-                }
-            }
-            grantStream2.close()
+        // Final summary
+        val summary = buildString {
+            if (granted.isNotEmpty()) appendLine("Granted:\n${granted.joinToString("\n")}")
+            if (failed.isNotEmpty()) appendLine("Failed:\n${failed.joinToString("\n")}")
+        }.trim()
 
-            if (grantOutput2.isEmpty() || !grantOutput2.contains("error", ignoreCase = true) && !grantOutput2.contains("fail", ignoreCase = true)) {
-                granted.add("PROJECT_MEDIA")
-            } else {
-                failed.add("PROJECT_MEDIA (${grantOutput2.trim()})")
-            }
-
-            val message = if (failed.isEmpty()) {
-                "All permissions granted successfully"
-            } else {
-                "Permissions granted: ${granted.joinToString(", ")}\nFailed: ${failed.joinToString(", ")}"
-            }
-
-            Result.success(message)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            Result.failure(e)
+        return@withContext if (failed.isEmpty()) {
+            Result.success(summary)
+        } else {
+            Result.failure(Exception(summary))
         }
     }
 }
